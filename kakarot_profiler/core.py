@@ -43,8 +43,8 @@ def load_references(program_file):
 
 def load_debug_info_section(program_file):
     """
-    Extrait la section "debug_info" du JSON pour récupérer les instruction_locations
-    et l'offset via "flow_tracking_data"
+    Charge la section debug_info en extrayant accessible_scopes
+    qui représente précisément les fonctions appelées.
     """
     with open(program_file, 'r') as f:
         data = json.load(f)
@@ -52,13 +52,22 @@ def load_debug_info_section(program_file):
     debug_info = data.get("debug_info", {})
     instruction_locations = debug_info.get("instruction_locations", {})
     mapped = {}
+    
     for k, v in instruction_locations.items():
+        accessible_scopes = v.get("accessible_scopes", [])
         offset = v.get("flow_tracking_data", {}).get("ap_tracking", {}).get("offset", 0)
+        if accessible_scopes:
+            # On prend la fonction la plus spécifique (la dernière dans la liste accessible_scopes)
+            func_name = accessible_scopes[-1]
+        else:
+            func_file = v.get("inst", {}).get("input_file", {}).get("filename", "Unknown")
+            line = v.get("inst", {}).get("start_line", "Unknown")
+            func_name = f"{func_name}:{line}"
         mapped[int(k)] = {
-            "source_file": v.get("inst", {}).get("input_file", {}).get("filename"),
-            "start_line": v.get("inst", {}).get("start_line"),
+            "function_name": accessible_scopes[-1] if accessible_scopes else func_name,
             "offset": offset
         }
+
     return mapped
 
 def combine_debug_mapping(program_file):
@@ -108,35 +117,33 @@ def combine_profile_with_debug(pc_counts, debug_mapping):
 
 def group_by_function_with_metrics(profile):
     """
-    Regroupe les PC par fonction et calcule les métriques :
-      - total_steps, inner_steps, nested_steps et call_count.
+    Regroupe tous les PC appartenant à la même fonction selon accessible_scopes,
+    et calcule les métriques associées.
     """
     metrics = {}
     for item in profile:
         debug = item["debug"]
-        if debug is None or debug.get("source") == "Unknown":
+        if debug is None or debug.get("function_name") == "Unknown":
             func = "Unknown"
         else:
-            if "source_file" in debug:
-                func = f"{debug.get('source_file')}:{debug.get('start_line')}"
-            elif "source" in debug:
-                func = debug.get("source")
-            else:
-                func = "Unknown"
+            func = debug.get("function_name")
+        
         if func not in metrics:
             metrics[func] = {"total_steps": 0, "inner_steps": 0, "nested_steps": 0, "call_count": 0}
+        
         metrics[func]["total_steps"] += item["steps"]
         metrics[func]["call_count"] += 1
-        if debug is not None and debug.get("offset", 0) == 0:
+        if debug.get("offset", 0) == 0:
             metrics[func]["inner_steps"] += item["steps"]
         else:
             metrics[func]["nested_steps"] += item["steps"]
     return metrics
 
+
 def calc_final_profiling(trace_file, program_file):
     """
     Ordonne l'ensemble du pipeline pour produire le profil final :
-    retourne (grouped_metrics, percent_with_debug)
+    retourne (grouped_metrics triés par total_steps décroissants, percent_with_debug)
     """
     pc_counts = load_trace(trace_file)
     base_mapping = combine_debug_mapping(program_file)
@@ -147,5 +154,7 @@ def calc_final_profiling(trace_file, program_file):
     total_unique_pc = len(pc_counts)
     count_with_debug = sum(1 for pc in pc_counts if extended_mapping.get(pc, {}).get("source") != "Unknown")
     percent_with_debug = (count_with_debug / total_unique_pc * 100) if total_unique_pc > 0 else 0
+
+    sorted_grouped_metrics = dict(sorted(grouped_metrics.items(), key=lambda x: x[1]["total_steps"], reverse=True))
     
-    return grouped_metrics, percent_with_debug
+    return sorted_grouped_metrics, percent_with_debug
